@@ -93,6 +93,27 @@ async fn commando_rpc_demo(pk: PublicKey, rune: &str) -> Result<(), lnsocket::Er
 
 ```
 
+## lnrpc
+
+`lnrpc` is a small command line tool for calling Core Lightning RPCs over Commando:
+
+```sh
+cargo install lnsocket --bin lnrpc
+
+lnrpc <nodeid> <host[:port]> <rune> getinfo
+lnrpc <nodeid> <host[:port]> <rune> listinvoices '{"label":"foo"}'
+```
+
+Pass several `method [params]` pairs to call them concurrently over one connection;
+results are printed in argument order:
+
+```sh
+lnrpc <nodeid> <host> <rune> getinfo listfunds listpeerchannels '{"id":"02..."}'
+```
+
+The port defaults to 9735 and `LNRPC_TIMEOUT` sets the per-call timeout in milliseconds
+(default 30000). Calls are never retried, so a dropped connection won't resend a `pay`.
+
 ## Status
 
 This library is experimental and under active development. APIs may change significantly between versions.
