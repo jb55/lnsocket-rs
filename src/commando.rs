@@ -418,6 +418,8 @@ async fn pump(mut sock: LNSocket, mut rx: mpsc::Receiver<Ctrl>, cfg: CommandoCon
                 }
             }
 
+            // read_custom is cancel-safe: when a request wins this select, the half-read
+            // reply stays on the socket for the next turn of the loop.
             res = sock.read_custom(|typ, buf| read_incoming_commando_message(typ, buf)) => {
                 match res {
                     Err(_e) => {
@@ -904,5 +906,141 @@ mod tests {
         assert_eq!(queue.len(), 2);
         assert_eq!(queue[0].cmd.req_id(), 42);
         assert_eq!(queue[1].cmd.req_id(), 43);
+    }
+
+    /// A commando reply frame as a node sends it: `req_id` then a piece of the JSON response.
+    struct ReplyFrame {
+        type_id: u16,
+        req_id: u64,
+        body: Vec<u8>,
+    }
+
+    impl Type for ReplyFrame {
+        fn type_id(&self) -> u16 {
+            self.type_id
+        }
+    }
+
+    impl Writeable for ReplyFrame {
+        fn write<W: Writer>(&self, writer: &mut W) -> Result<(), std::io::Error> {
+            self.req_id.write(writer)?;
+            writer.write_all(&self.body)
+        }
+    }
+
+    /// Plays the node: echoes each command's params back as its result, in two reply frames,
+    /// writing them so the client's pump is partway through a frame whenever its next request
+    /// arrives.
+    async fn echo_peer(
+        stream: tokio::net::TcpStream,
+        channel: crate::ln::peer_channel_encryptor::PeerChannelEncryptor,
+    ) {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // The reader only touches the receive nonce and the writer only the send nonce; the
+        // lock is never held across an await.
+        let channel = Arc::new(Mutex::new(channel));
+        let (mut rd, mut wr) = stream.into_split();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<(u64, Value)>();
+
+        let rd_channel = channel.clone();
+        tokio::spawn(async move {
+            loop {
+                let mut hdr = [0u8; 18];
+                if rd.read_exact(&mut hdr).await.is_err() {
+                    return;
+                }
+                let len = rd_channel
+                    .lock()
+                    .unwrap()
+                    .decrypt_length_header(&hdr)
+                    .unwrap();
+                let mut buf = vec![0u8; len as usize + 16];
+                rd.read_exact(&mut buf).await.unwrap();
+                rd_channel
+                    .lock()
+                    .unwrap()
+                    .decrypt_message(&mut buf)
+                    .unwrap();
+                let msg = &buf[..len as usize];
+                assert_eq!(u16::from_be_bytes([msg[0], msg[1]]), COMMANDO_COMMAND);
+                let req_id = u64::from_be_bytes(msg[2..10].try_into().unwrap());
+                let cmd: CommandoCommand = serde_json::from_slice(&msg[10..]).unwrap();
+                let _ = cmd_tx.send((req_id, cmd.params().clone()));
+            }
+        });
+
+        // Each write ends 7 bytes into the next frame's length header. The pump reads the frame
+        // that completes a reply, hands the answer back, and is left holding those 7 bytes when
+        // the caller's next request arrives.
+        let mut carry: Vec<u8> = Vec::new();
+        while let Some((req_id, params)) = cmd_rx.recv().await {
+            let reply = serde_json::to_vec(&serde_json::json!({ "result": params })).unwrap();
+            let (head, tail) = reply.split_at(reply.len() / 2);
+            for (type_id, body) in [(COMMANDO_REPLY_CONT, head), (COMMANDO_REPLY_TERM, tail)] {
+                let frame = ReplyFrame {
+                    type_id,
+                    req_id,
+                    body: body.to_vec(),
+                };
+                let bytes = channel.lock().unwrap().encrypt_message(&frame);
+                carry.extend_from_slice(&bytes[..7]);
+                if wr.write_all(&carry).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                carry.clear();
+                carry.extend_from_slice(&bytes[7..]);
+            }
+            // Nothing queued to carry the tail: send it now, or the last calls never finish.
+            if cmd_rx.is_empty() && wr.write_all(&std::mem::take(&mut carry)).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Many calls in flight over one connection, with new requests arriving while replies are
+    /// half read: every call gets its own answer. Before the read side kept its partial frame
+    /// across a cancelled `read_custom`, the first request to arrive mid-frame tore the stream
+    /// and every pending call failed with BrokenPipe.
+    #[tokio::test]
+    async fn pump_keeps_partial_reply_when_a_request_arrives_mid_frame() {
+        use std::sync::Arc;
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        let (peer, _) = accepted.unwrap();
+        peer.set_nodelay(true).unwrap();
+
+        let (ours, theirs) =
+            crate::ln::peer_channel_encryptor::PeerChannelEncryptor::finished_pair();
+        tokio::spawn(echo_peer(peer, theirs));
+
+        let sock = LNSocket::from_finished(ours, client.unwrap());
+        let config = CommandoConfig::new()
+            .no_reconnect()
+            .retry_policy(RetryPolicy::Never)
+            .timeout(Some(Duration::from_secs(20)));
+        let client = Arc::new(CommandoClient::spawn_with_config(sock, "rune", config));
+
+        const IN_FLIGHT: u64 = 32;
+        const PER_WORKER: u64 = 8;
+        let mut workers = tokio::task::JoinSet::new();
+        for w in 0..IN_FLIGHT {
+            let client = client.clone();
+            workers.spawn(async move {
+                for k in 0..PER_WORKER {
+                    let n = w * PER_WORKER + k;
+                    let got = client.call("echo", serde_json::json!({ "n": n })).await;
+                    assert_eq!(got.unwrap(), serde_json::json!({ "n": n }), "call {n}");
+                }
+            });
+        }
+        while let Some(res) = workers.join_next().await {
+            res.unwrap();
+        }
     }
 }

@@ -49,6 +49,21 @@ pub struct LNSocket {
     channel: PeerChannelEncryptor,
     stream: LnStream,
     reconnect: ReconnectData,
+    frame: PartialFrame,
+}
+
+/// The incoming frame read so far. It lives on the socket rather than in the read future, so a
+/// [`LNSocket::read_custom`] dropped partway through (as a `tokio::select!` branch that lost)
+/// leaves the bytes it had read, and the length header it had decrypted, for the next call.
+#[derive(Default)]
+struct PartialFrame {
+    /// Bytes of the current stage: the 18-byte length header, then the body and its MAC.
+    buf: Vec<u8>,
+    /// How much of `buf` has been read off the stream.
+    filled: usize,
+    /// The body's length once the header has been decrypted. Decrypting moves the noise
+    /// receive nonce, so it happens exactly once per frame.
+    body_len: Option<usize>,
 }
 
 impl LNSocket {
@@ -136,7 +151,29 @@ impl LNSocket {
                 their_pubkey,
                 addr: addr.to_string(),
             },
+            frame: PartialFrame::default(),
         })
+    }
+
+    /// A socket over an already-connected stream whose handshake is done, for tests that play
+    /// the peer themselves. Reconnecting it fails: its reconnect address goes nowhere.
+    #[cfg(test)]
+    pub(crate) fn from_finished(
+        channel: PeerChannelEncryptor,
+        stream: tokio::net::TcpStream,
+    ) -> LNSocket {
+        let our_key = SecretKey::from_slice(&[0x44; 32]).expect("valid key");
+        let their_pubkey = PublicKey::from_secret_key(&Secp256k1::signing_only(), &our_key);
+        Self {
+            channel,
+            stream: LnStream::Direct(stream),
+            reconnect: ReconnectData {
+                our_key,
+                their_pubkey,
+                addr: "127.0.0.1:1".to_string(),
+            },
+            frame: PartialFrame::default(),
+        }
     }
 
     /// Connect as above and also perform a minimal `init` exchange.
@@ -205,6 +242,11 @@ impl LNSocket {
         self.read_custom(|_type, _buf| Ok(None)).await
     }
 
+    /// Read the next message, handing custom message types to `handler`.
+    ///
+    /// Cancel-safe: if the future is dropped before it completes, the part of the frame it had
+    /// read stays on the socket and the next call picks up from there, so it can be raced
+    /// against other work in `tokio::select!`.
     pub async fn read_custom<T>(
         &mut self,
         handler: impl FnOnce(u16, &mut Cursor<&[u8]>) -> Result<Option<T>, DecodeError>,
@@ -212,19 +254,50 @@ impl LNSocket {
     where
         T: core::fmt::Debug,
     {
-        let mut hdr = [0u8; 18];
-
-        self.stream.read_exact(&mut hdr).await?;
-        let size = self.channel.decrypt_length_header(&hdr)? as usize;
-        //println!("len header {size}");
-        let mut buf = vec![0; size + 16];
-        self.stream.read_exact(&mut buf).await?;
-        //println!("got cipher bytes {}", hex::encode(&buf));
-        self.channel.decrypt_message(&mut buf)?;
-        let u8_buf: &[u8] = &buf[..buf.len() - 16];
-        let mut cursor = io::Cursor::new(u8_buf);
+        let buf = self.read_frame().await?;
+        let mut cursor = io::Cursor::new(&buf[..]);
 
         Ok(wire::read(&mut cursor, handler).map_err(|(de, _)| de)?)
+    }
+
+    /// Read and decrypt one whole frame, returning its plaintext body.
+    ///
+    /// Every await is in [`LNSocket::fill`], which is cancel-safe; the state changes between
+    /// them happen without yielding, so a drop at any await loses nothing.
+    async fn read_frame(&mut self) -> Result<Vec<u8>, Error> {
+        if self.frame.body_len.is_none() {
+            self.fill(18).await?;
+            let hdr: [u8; 18] = self.frame.buf[..18].try_into().expect("filled 18 bytes");
+            let size = self.channel.decrypt_length_header(&hdr)? as usize;
+            self.frame.body_len = Some(size);
+            self.frame.filled = 0;
+        }
+
+        let size = self.frame.body_len.expect("header decrypted above");
+        self.fill(size + 16).await?;
+        let mut buf = std::mem::take(&mut self.frame).buf;
+        self.channel.decrypt_message(&mut buf)?;
+        buf.truncate(size);
+        Ok(buf)
+    }
+
+    /// Read until the current stage of the frame holds `want` bytes.
+    ///
+    /// Cancel-safe: a single `read` either returns bytes or reads none, and the count is
+    /// recorded before the next await.
+    async fn fill(&mut self, want: usize) -> io::Result<()> {
+        self.frame.buf.resize(want, 0);
+        while self.frame.filled < want {
+            let n = self
+                .stream
+                .read(&mut self.frame.buf[self.frame.filled..])
+                .await?;
+            if n == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            self.frame.filled += n;
+        }
+        Ok(())
     }
 }
 

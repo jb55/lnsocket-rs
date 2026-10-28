@@ -88,6 +88,30 @@ pub struct PeerChannelEncryptor {
     noise_state: NoiseState,
 }
 
+#[cfg(test)]
+impl PeerChannelEncryptor {
+    /// Two encryptors past the handshake whose keys mirror each other, so what one encrypts the
+    /// other decrypts. Lets a test stand up both ends of a connection without the inbound
+    /// handshake, which this crate does not implement.
+    pub(crate) fn finished_pair() -> (PeerChannelEncryptor, PeerChannelEncryptor) {
+        let a_to_b = [0x11; 32];
+        let b_to_a = [0x22; 32];
+        let ck = [0x33; 32];
+        let end = |sk, rk| PeerChannelEncryptor {
+            their_node_id: None,
+            noise_state: NoiseState::Finished {
+                sk,
+                sn: 0,
+                sck: ck,
+                rk,
+                rn: 0,
+                rck: ck,
+            },
+        };
+        (end(a_to_b, b_to_a), end(b_to_a, a_to_b))
+    }
+}
+
 impl PeerChannelEncryptor {
     pub fn new_outbound(
         their_node_id: PublicKey,
