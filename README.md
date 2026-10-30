@@ -98,17 +98,37 @@ async fn commando_rpc_demo(pk: PublicKey, rune: &str) -> Result<(), lnsocket::Er
 `lnrpc` is a small command line tool for calling Core Lightning RPCs over Commando:
 
 ```sh
-cargo install lnsocket --bin lnrpc
-
-lnrpc <nodeid> <host[:port]> <rune> getinfo
-lnrpc <nodeid> <host[:port]> <rune> listinvoices '{"label":"foo"}'
+cargo install lnsocket --features cli --bin lnrpc
 ```
+
+Save a node once, then call it by name. The first node added is the default:
+
+```sh
+lnrpc config add mynode <nodeid> <host[:port]> <rune>
+lnrpc getinfo
+lnrpc -n othernode listinvoices '{"label":"foo"}'
+```
+
+Nodes live in `~/.config/lnrpc/config.toml` (or `$XDG_CONFIG_HOME/lnrpc/config.toml`,
+`$LNRPC_CONFIG`, or `-c <path>`), written with mode 0600 since it holds runes:
+
+```toml
+default = "mynode"
+
+[nodes.mynode]
+nodeid = "02..."
+host = "ln.example.com:9735"
+rune = "..."
+```
+
+`lnrpc config list`, `config default <name>`, `config rm <name>` and `config path` manage it.
+The C lnrpc form still works without a config: `lnrpc <nodeid> <host> <rune> <method> [params]`.
 
 Pass several `method [params]` pairs to call them concurrently over one connection;
 results are printed in argument order:
 
 ```sh
-lnrpc <nodeid> <host> <rune> getinfo listfunds listpeerchannels '{"id":"02..."}'
+lnrpc getinfo listfunds listpeerchannels '{"id":"02..."}'
 ```
 
 The port defaults to 9735 and `LNRPC_TIMEOUT` sets the per-call timeout in milliseconds
