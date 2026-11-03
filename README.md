@@ -134,6 +134,29 @@ lnrpc getinfo listfunds listpeerchannels '{"id":"02..."}'
 The port defaults to 9735 and `LNRPC_TIMEOUT` sets the per-call timeout in milliseconds
 (default 30000). Calls are never retried, so a dropped connection won't resend a `pay`.
 
+Leave out the method to connect once and type calls at a prompt, with line editing
+and history (kept in `~/.local/state/lnrpc/history`, or under `$XDG_STATE_HOME`):
+
+```sh
+$ lnrpc -n mynode
+mynode> getinfo
+mynode> listinvoices {"label": "coffee for two"}
+mynode> listfunds listpeerchannels
+```
+
+Each line follows the same rule as the arguments, and JSON params may contain spaces.
+`exit`, `quit` or ctrl-d ends the session, and an error on one line doesn't. Piped
+lines run the same way without a prompt, skipping blank lines and `#` comments, and
+the exit status is non-zero if any of them failed:
+
+```sh
+printf 'getinfo\nlistfunds\n' | lnrpc -n mynode
+```
+
+The session reconnects if the socket drops, but still never resends: a call that was
+in flight when the connection broke fails with an error saying it may or may not have
+run on the node. Ctrl-c during a call stops waiting for it, not the call itself.
+
 ## Status
 
 This library is experimental and under active development. APIs may change significantly between versions.

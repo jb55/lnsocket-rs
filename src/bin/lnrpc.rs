@@ -13,12 +13,18 @@
 //! over one connection and their results are printed in argument order. An
 //! argument starting with `{` or `[` is the params of the method before it.
 //!
+//! With no method, `lnrpc` connects once and reads calls from stdin, one line
+//! at a time, using the same rule (`listinvoices {"label":"foo bar"}`). A
+//! terminal gets a prompt and history; piped lines are run without one.
+//!
 //! The config lives at `-c <path>`, `$LNRPC_CONFIG`,
 //! `$XDG_CONFIG_HOME/lnrpc/config.toml` or `~/.config/lnrpc/config.toml`,
 //! first found wins. The port defaults to 9735. `LNRPC_TIMEOUT` sets the call
-//! timeout in milliseconds (default 30000).
+//! timeout in milliseconds (default 30000). REPL history is kept in
+//! `$XDG_STATE_HOME/lnrpc/history` or `~/.local/state/lnrpc/history`.
 
 use std::collections::BTreeMap;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::str::FromStr;
@@ -28,12 +34,15 @@ use std::time::Duration;
 use bitcoin::secp256k1::{PublicKey, SecretKey, rand};
 use lnsocket::commando::{CommandoConfig, RetryPolicy};
 use lnsocket::{CommandoClient, Error, LNSocket};
+use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::io::AsyncBufReadExt;
 
 const USAGE: &str = "\
-usage: lnrpc [-c <config>] [-n <node>] <method> [params (json)] [<method> [params] ...]
-       lnrpc <nodeid> <host[:port]> <rune> <method> [params] [<method> [params] ...]
+usage: lnrpc [-c <config>] [-n <node>] [<method> [params (json)] [<method> [params] ...]]
+       lnrpc <nodeid> <host[:port]> <rune> [<method> [params] [<method> [params] ...]]
        lnrpc [-c <config>] config <add|rm|default|list|path> ...
 
   config add <name> <nodeid> <host[:port]> <rune>   save a node (first one becomes default)
@@ -42,7 +51,8 @@ usage: lnrpc [-c <config>] [-n <node>] <method> [params (json)] [<method> [param
   config list                                       show saved nodes (runes are not printed)
   config path                                       print the config file location
 
-multiple methods are called concurrently over one connection.
+multiple methods are called concurrently over one connection. with no method,
+read `method [params]` lines from stdin over one connection (exit or ctrl-d quits).
 currently supports commando for clightning, but potentially more rpc types in the future!";
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -94,17 +104,12 @@ async fn run(mut args: Vec<String>) -> Result<bool, String> {
         args.remove(0);
     }
 
-    if args.is_empty() {
-        eprintln!("{USAGE}");
-        return Ok(false);
-    }
-
     // An explicit node id first means the C lnrpc form; nothing else is read.
-    if PublicKey::from_str(&args[0]).is_ok() {
+    if args.first().is_some_and(|a| PublicKey::from_str(a).is_ok()) {
         if node_name.is_some() {
             return Err("-n can't be used with an explicit nodeid".into());
         }
-        if args.len() < 4 {
+        if args.len() < 3 {
             eprintln!("{USAGE}");
             return Ok(false);
         }
@@ -113,6 +118,9 @@ async fn run(mut args: Vec<String>) -> Result<bool, String> {
             host: args[1].clone(),
             rune: args[2].clone(),
         };
+        if args.len() == 3 {
+            return repl(&node, "lnrpc").await;
+        }
         return call(&node, parse_calls(&args[3..])?).await;
     }
 
@@ -121,12 +129,17 @@ async fn run(mut args: Vec<String>) -> Result<bool, String> {
         None => default_config_path()?,
     };
 
-    if args[0] == "config" {
+    if args.first().is_some_and(|a| a == "config") {
         config_cmd(&path, &args[1..])?;
         return Ok(true);
     }
 
     let config = load_config(&path)?;
+    // A bare `lnrpc` with nothing configured is asking how to use it.
+    if args.is_empty() && node_name.is_none() && config.nodes.is_empty() {
+        eprintln!("{USAGE}");
+        return Ok(false);
+    }
     let name = node_name.or(config.default.clone()).ok_or_else(|| {
         format!(
             "no node given and no default in {}; add one with `lnrpc config add`",
@@ -138,6 +151,9 @@ async fn run(mut args: Vec<String>) -> Result<bool, String> {
         .get(&name)
         .ok_or_else(|| format!("no node named '{name}' in {}", path.display()))?;
 
+    if args.is_empty() {
+        return repl(node, &name).await;
+    }
     call(node, parse_calls(&args)?).await
 }
 
@@ -250,8 +266,17 @@ fn parse_calls(args: &[String]) -> Result<Vec<(String, Value)>, String> {
     Ok(calls)
 }
 
-/// Returns whether every call succeeded.
-async fn call(node: &Node, calls: Vec<(String, Value)>) -> Result<bool, String> {
+fn call_timeout() -> Result<Duration, String> {
+    let timeout_ms = match std::env::var("LNRPC_TIMEOUT") {
+        Ok(t) => t
+            .parse::<u64>()
+            .map_err(|_| format!("invalid LNRPC_TIMEOUT '{t}'"))?,
+        Err(_) => 30_000,
+    };
+    Ok(Duration::from_millis(timeout_ms))
+}
+
+async fn connect(node: &Node, config: CommandoConfig) -> Result<Arc<CommandoClient>, String> {
     let nodeid = &node.nodeid;
     let their_pubkey =
         PublicKey::from_str(nodeid).map_err(|e| format!("invalid nodeid '{nodeid}': {e}"))?;
@@ -262,31 +287,34 @@ async fn call(node: &Node, calls: Vec<(String, Value)>) -> Result<bool, String> 
         format!("{}:9735", node.host)
     };
 
-    let timeout_ms = match std::env::var("LNRPC_TIMEOUT") {
-        Ok(t) => t
-            .parse::<u64>()
-            .map_err(|_| format!("invalid LNRPC_TIMEOUT '{t}'"))?,
-        Err(_) => 30_000,
-    };
-
     let key = SecretKey::new(&mut rand::thread_rng());
     let sock = LNSocket::connect_and_init(key, their_pubkey, &addr)
         .await
         .map_err(|e| format!("connecting to {addr}: {e}"))?;
 
-    // A one-shot CLI shouldn't silently resend a command (eg. `pay`) after a
-    // broken connection, so turn off reconnects and retries.
-    let config = CommandoConfig::new()
-        .timeout(Some(Duration::from_millis(timeout_ms)))
-        .no_reconnect()
-        .retry_policy(RetryPolicy::Never);
-    let commando = Arc::new(CommandoClient::spawn_with_config(
+    Ok(Arc::new(CommandoClient::spawn_with_config(
         sock,
         node.rune.as_str(),
         config,
-    ));
+    )))
+}
 
-    // Fire every call before awaiting any; the pump demuxes the replies.
+/// Returns whether every call succeeded.
+async fn call(node: &Node, calls: Vec<(String, Value)>) -> Result<bool, String> {
+    // A one-shot CLI shouldn't silently resend a command (eg. `pay`) after a
+    // broken connection, so turn off reconnects and retries.
+    let config = CommandoConfig::new()
+        .timeout(Some(call_timeout()?))
+        .no_reconnect()
+        .retry_policy(RetryPolicy::Never);
+    let commando = connect(node, config).await?;
+    Ok(run_calls(&commando, calls).await)
+}
+
+/// Fire every call before awaiting any, then print the results in order.
+/// Returns whether every call succeeded.
+async fn run_calls(commando: &Arc<CommandoClient>, calls: Vec<(String, Value)>) -> bool {
+    // The pump demuxes the replies.
     let handles: Vec<_> = calls
         .into_iter()
         .map(|(method, params)| {
@@ -300,21 +328,261 @@ async fn call(node: &Node, calls: Vec<(String, Value)>) -> Result<bool, String> 
     let mut all_ok = true;
     for (method, handle) in handles {
         match handle.await {
-            Ok(Ok(result)) => println!("{}", serde_json::to_string_pretty(&result).unwrap()),
+            Ok(Ok(result)) => {
+                println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                continue;
+            }
             Ok(Err(Error::Rpc(rpc))) => {
                 eprintln!("error: {method}: {} (code {})", rpc.message, rpc.code);
-                all_ok = false;
             }
-            Ok(Err(e)) => {
-                eprintln!("error: {method}: {e}");
-                all_ok = false;
+            Ok(Err(Error::Io(std::io::ErrorKind::BrokenPipe))) => {
+                eprintln!(
+                    "error: {method}: connection lost before a reply; \
+                     not resent, it may or may not have run on the node"
+                );
             }
+            Ok(Err(e)) => eprintln!("error: {method}: {e}"),
+            Err(e) => eprintln!("error: {method}: task failed: {e}"),
+        }
+        all_ok = false;
+    }
+    all_ok
+}
+
+/// Read `method [params] ...` lines and call them over one connection.
+///
+/// Returns whether every line succeeded when stdin is piped; a terminal
+/// session always exits successfully.
+async fn repl(node: &Node, name: &str) -> Result<bool, String> {
+    let interactive = std::io::stdin().is_terminal();
+
+    // Unlike the one-shot CLI, a long-lived session should ride out a dropped
+    // socket, so reconnects stay on. Retries stay off: on a broken pipe the
+    // pump fails every in-flight `RetryPolicy::Never` call with BrokenPipe
+    // instead of resending it, so a `pay` can't run twice behind our back.
+    let config = CommandoConfig::new()
+        .timeout(Some(call_timeout()?))
+        .retry_policy(RetryPolicy::Never);
+
+    // Connect before the first prompt so a bad node fails fast.
+    let mut commando = connect(node, config.clone()).await?;
+    let mut input = Input::new(interactive, format!("{name}> "));
+    let mut all_ok = true;
+
+    while let Some(line) = input.next_line().await? {
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
+        let words = match split_line(&line) {
+            Ok(words) => words,
             Err(e) => {
-                eprintln!("error: {method}: task failed: {e}");
+                eprintln!("error: {e}");
                 all_ok = false;
+                continue;
             }
+        };
+        match words.first().map(String::as_str) {
+            None => continue,
+            Some("exit" | "quit") if words.len() == 1 => break,
+            Some(_) => {}
+        }
+        let calls = parse_calls(&words).expect("words is not empty");
+
+        // The pump stops if it gives up reconnecting, so start over with a
+        // fresh connection rather than fail every line from here on.
+        if commando.is_closed() {
+            match connect(node, config.clone()).await {
+                Ok(c) => commando = c,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    all_ok = false;
+                    continue;
+                }
+            }
+        }
+
+        all_ok &= if interactive {
+            tokio::select! {
+                ok = run_calls(&commando, calls) => ok,
+                _ = tokio::signal::ctrl_c() => {
+                    eprintln!("interrupted; the call may still complete on the node");
+                    false
+                }
+            }
+        } else {
+            run_calls(&commando, calls).await
+        };
+    }
+
+    input.save_history();
+    Ok(all_ok || interactive)
+}
+
+/// Split a REPL line into the words `parse_calls` takes, as if each had been
+/// its own argument. A word starting with `{` or `[` runs to the end of that
+/// JSON value, so params may contain spaces.
+fn split_line(line: &str) -> Result<Vec<String>, String> {
+    let mut words = Vec::new();
+    let mut rest = line.trim_start();
+    while !rest.is_empty() {
+        let len = if rest.starts_with(['{', '[']) {
+            let mut values =
+                serde_json::Deserializer::from_str(rest).into_iter::<serde::de::IgnoredAny>();
+            if let Some(Err(e)) = values.next() {
+                return Err(format!("invalid params json: {e}"));
+            }
+            let len = values.byte_offset();
+            if len < rest.len() && !rest[len..].starts_with(char::is_whitespace) {
+                return Err(format!(
+                    "expected a space after params json: {}",
+                    &rest[..len]
+                ));
+            }
+            len
+        } else {
+            rest.find(char::is_whitespace).unwrap_or(rest.len())
+        };
+        words.push(rest[..len].to_string());
+        rest = rest[len..].trim_start();
+    }
+    Ok(words)
+}
+
+/// REPL lines from a terminal (with editing and history) or a pipe.
+enum Input {
+    Tty {
+        /// Moved into a blocking task while a line is read, so the pump keeps
+        /// answering pings and noticing a dropped socket meanwhile.
+        editor: Option<DefaultEditor>,
+        prompt: String,
+        history: Option<PathBuf>,
+    },
+    Pipe(tokio::io::Lines<tokio::io::BufReader<tokio::io::Stdin>>),
+}
+
+impl Input {
+    fn new(interactive: bool, prompt: String) -> Self {
+        if !interactive {
+            return Input::Pipe(tokio::io::BufReader::new(tokio::io::stdin()).lines());
+        }
+        let editor = match DefaultEditor::new() {
+            Ok(mut editor) => {
+                let history = history_path();
+                if let Some(path) = &history {
+                    let _ = editor.load_history(path);
+                }
+                return Input::Tty {
+                    editor: Some(editor),
+                    prompt,
+                    history,
+                };
+            }
+            Err(e) => e,
+        };
+        eprintln!("warning: no line editing: {editor}");
+        Input::Pipe(tokio::io::BufReader::new(tokio::io::stdin()).lines())
+    }
+
+    /// The next line, or `None` at end of input.
+    async fn next_line(&mut self) -> Result<Option<String>, String> {
+        match self {
+            Input::Pipe(lines) => lines.next_line().await.map_err(|e| e.to_string()),
+            Input::Tty { editor, prompt, .. } => loop {
+                let mut ed = editor.take().expect("editor is put back after each line");
+                let p = prompt.clone();
+                let (ed, res) = tokio::task::spawn_blocking(move || {
+                    let res = ed.readline(&p);
+                    (ed, res)
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+                let ed = editor.insert(ed);
+                match res {
+                    Ok(line) => {
+                        if !line.trim().is_empty() {
+                            let _ = ed.add_history_entry(line.as_str());
+                        }
+                        return Ok(Some(line));
+                    }
+                    // ctrl-c at the prompt drops the line, like a shell.
+                    Err(ReadlineError::Interrupted) => continue,
+                    Err(ReadlineError::Eof) => return Ok(None),
+                    Err(e) => return Err(e.to_string()),
+                }
+            },
         }
     }
 
-    Ok(all_ok)
+    fn save_history(&mut self) {
+        let Input::Tty {
+            editor: Some(editor),
+            history: Some(path),
+            ..
+        } = self
+        else {
+            return;
+        };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Err(e) = editor.save_history(path) {
+            eprintln!("warning: saving history to {}: {e}", path.display());
+        }
+    }
+}
+
+fn history_path() -> Option<PathBuf> {
+    let base = match std::env::var_os("XDG_STATE_HOME") {
+        Some(x) if !x.is_empty() => PathBuf::from(x),
+        _ => PathBuf::from(std::env::var_os("HOME")?).join(".local/state"),
+    };
+    Some(base.join("lnrpc").join("history"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn words(line: &str) -> Vec<String> {
+        split_line(line).unwrap()
+    }
+
+    #[test]
+    fn split_line_plain_words() {
+        assert_eq!(words("  getinfo   listfunds "), ["getinfo", "listfunds"]);
+        assert!(words("   ").is_empty());
+    }
+
+    #[test]
+    fn split_line_json_with_spaces() {
+        assert_eq!(
+            words(r#"listinvoices {"label": "foo bar"} getinfo"#),
+            ["listinvoices", r#"{"label": "foo bar"}"#, "getinfo"]
+        );
+        assert_eq!(
+            words(r#"decode [ "lnbc1 x", {"a": [1, 2]} ]"#),
+            ["decode", r#"[ "lnbc1 x", {"a": [1, 2]} ]"#]
+        );
+        // A brace inside a string doesn't end the value early.
+        assert_eq!(
+            words(r#"invoice {"description":"} ]"}"#),
+            ["invoice", r#"{"description":"} ]"}"#]
+        );
+    }
+
+    #[test]
+    fn split_line_matches_parse_calls() {
+        let calls = parse_calls(&words(r#"listinvoices {"label":"a b"} getinfo"#)).unwrap();
+        assert_eq!(calls[0].0, "listinvoices");
+        assert_eq!(calls[0].1, serde_json::json!({"label": "a b"}));
+        assert_eq!(calls[1].0, "getinfo");
+        assert_eq!(calls[1].1, serde_json::json!({}));
+    }
+
+    #[test]
+    fn split_line_rejects_bad_json() {
+        assert!(split_line(r#"listinvoices {"label":"#).is_err());
+        assert!(split_line(r#"listinvoices {"label":foo}"#).is_err());
+        assert!(split_line(r#"listinvoices {"label":"a"}getinfo"#).is_err());
+    }
 }

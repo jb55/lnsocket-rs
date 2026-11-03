@@ -347,6 +347,12 @@ impl CommandoClient {
         Self::spawn_with_config(sock, rune, CommandoConfig::default())
     }
 
+    /// Whether the background pump has stopped, eg. after giving up on
+    /// reconnecting. Every call on a closed client fails without being sent.
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
     #[inline]
     fn alloc_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
